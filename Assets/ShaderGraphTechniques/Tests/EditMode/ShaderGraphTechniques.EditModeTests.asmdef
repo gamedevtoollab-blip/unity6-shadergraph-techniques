@@ -1,0 +1,12 @@
+{
+  "name": "ShaderGraphTechniques.EditModeTests",
+  "rootNamespace": "ShaderGraphTechniques.Tests",
+  "references": [
+    "ShaderGraphTechniques.Runtime",
+    "ShaderGraphTechniques.Demo",
+    "Unity.RenderPipelines.Core.Runtime"
+  ],
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "autoReferenced": false
+}

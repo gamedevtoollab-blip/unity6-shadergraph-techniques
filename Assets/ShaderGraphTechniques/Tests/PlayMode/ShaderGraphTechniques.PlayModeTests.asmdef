@@ -1,0 +1,10 @@
+{
+  "name": "ShaderGraphTechniques.PlayModeTests",
+  "rootNamespace": "ShaderGraphTechniques.Tests",
+  "references": [
+    "ShaderGraphTechniques.Runtime",
+    "ShaderGraphTechniques.Demo"
+  ],
+  "optionalUnityReferences": ["TestAssemblies"],
+  "autoReferenced": false
+}

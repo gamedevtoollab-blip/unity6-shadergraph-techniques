@@ -1,0 +1,10 @@
+{
+  "name": "ShaderGraphTechniques.Runtime",
+  "rootNamespace": "ShaderGraphTechniques",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "autoReferenced": true,
+  "noEngineReferences": false
+}

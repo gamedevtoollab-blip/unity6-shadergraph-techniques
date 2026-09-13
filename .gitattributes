@@ -1,0 +1,16 @@
+# Unity serializes empty YAML values with a significant-looking trailing space.
+# Keep whitespace checks enabled for source and documentation, but do not flag
+# Unity-generated text asset formats for their normal serialization style.
+*.asset whitespace=-blank-at-eol
+*.asmdef whitespace=-blank-at-eol
+*.inputactions whitespace=-blank-at-eol
+*.mat whitespace=-blank-at-eol
+*.meta whitespace=-blank-at-eol
+*.prefab whitespace=-blank-at-eol
+*.shadergraph whitespace=-blank-at-eol,-blank-at-eof
+*.shadersubgraph whitespace=-blank-at-eol,-blank-at-eof
+*.unity whitespace=-blank-at-eol
+*.wlt whitespace=-blank-at-eol
+
+# Binary assets must never be line-ending normalized.
+*.png binary

@@ -1,0 +1,547 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
+using UnityEditor;
+using UnityEditor.PackageManager;
+using UnityEditor.SceneManagement;
+using UnityEngine;
+using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
+
+public static class ShaderGraphPackageMigrationValidator
+{
+    const string RuntimeRoot = "Assets/ShaderGraphTechniques/Runtime";
+
+    static readonly string[] EffectIds =
+    {
+        "01_Dissolve", "02_IntersectionShield", "03_HeatHaze",
+        "04_TriplanarSnow", "05_InteractiveGrass", "06_ScanPulse"
+    };
+
+    static readonly Dictionary<string, string> Prefabs = new Dictionary<string, string>
+    {
+        { "01_Dissolve", RuntimeRoot + "/01_Dissolve/PF_01_Dissolve.prefab" },
+        { "02_IntersectionShield", RuntimeRoot + "/02_IntersectionShield/PF_02_IntersectionShield.prefab" },
+        { "03_HeatHaze", RuntimeRoot + "/03_HeatHaze/PF_03_HeatHaze.prefab" },
+        { "04_TriplanarSnow", RuntimeRoot + "/04_TriplanarSnow/PF_04_TriplanarSnow.prefab" },
+        { "05_InteractiveGrass", RuntimeRoot + "/05_InteractiveGrass/PF_05_InteractiveGrass.prefab" },
+        { "06_ScanPulse", RuntimeRoot + "/06_ScanPulse/PF_06_ScanPulse.prefab" }
+    };
+
+    static readonly Dictionary<string, string> Graphs = new Dictionary<string, string>
+    {
+        { "01_Dissolve", RuntimeRoot + "/01_Dissolve/SG_01_Dissolve.shadergraph" },
+        { "02_IntersectionShield", RuntimeRoot + "/02_IntersectionShield/SG_02_IntersectionShield.shadergraph" },
+        { "03_HeatHaze", RuntimeRoot + "/03_HeatHaze/SG_03_HeatHaze.shadergraph" },
+        { "04_TriplanarSnow", RuntimeRoot + "/04_TriplanarSnow/SG_04_TriplanarSnow.shadergraph" },
+        { "05_InteractiveGrass", RuntimeRoot + "/05_InteractiveGrass/SG_05_InteractiveGrass.shadergraph" },
+        { "06_ScanPulse", RuntimeRoot + "/06_ScanPulse/SG_06_ScanPulse.shadergraph" }
+    };
+
+    public static void Run()
+    {
+        var effectArgument = GetArgument("-migrationEffect");
+        var packagePath = GetArgument("-migrationPackage");
+        var evidenceRoot = GetArgument("-migrationEvidenceRoot");
+        if (string.IsNullOrWhiteSpace(effectArgument)) throw new ArgumentException("Missing -migrationEffect.");
+        if (string.IsNullOrWhiteSpace(packagePath) || !File.Exists(packagePath)) throw new FileNotFoundException("Missing migration package.", packagePath);
+        if (string.IsNullOrWhiteSpace(evidenceRoot)) throw new ArgumentException("Missing -migrationEvidenceRoot.");
+        evidenceRoot = Path.GetFullPath(evidenceRoot);
+        Directory.CreateDirectory(evidenceRoot);
+
+        var checks = new List<CheckEvidence>();
+        ConfigureProject(checks);
+        var targets = string.Equals(effectArgument, "Runtime-All", StringComparison.OrdinalIgnoreCase)
+            ? EffectIds
+            : new[] { effectArgument };
+        if (targets.Any(effect => !EffectIds.Contains(effect)))
+            throw new ArgumentException("Unknown migration effect: " + effectArgument);
+
+        var effects = new List<EffectEvidence>();
+        foreach (var effect in targets) effects.Add(ValidateEffect(effect, evidenceRoot));
+
+        var urpPackage = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages().FirstOrDefault(item => item.name == "com.unity.render-pipelines.universal");
+        var shaderGraphPackage = UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages().FirstOrDefault(item => item.name == "com.unity.shadergraph");
+        var report = new MigrationEvidence
+        {
+            generatedUtc = DateTime.UtcNow.ToString("O"),
+            projectPath = Directory.GetParent(Application.dataPath).FullName,
+            unityVersion = Application.unityVersion,
+            urpVersion = urpPackage != null ? urpPackage.version : "missing",
+            shaderGraphVersion = shaderGraphPackage != null ? shaderGraphPackage.version : "missing",
+            packagePath = Path.GetFullPath(packagePath),
+            packageSha256 = Sha256(packagePath),
+            requestedEffect = effectArgument,
+            projectChecks = checks.ToArray(),
+            effects = effects.ToArray()
+        };
+        report.passed = report.projectChecks.All(check => check.passed) && report.effects.All(effect => effect.passed);
+        var jsonPath = Path.Combine(evidenceRoot, "migration-validation.json");
+        File.WriteAllText(jsonPath, JsonUtility.ToJson(report, true), new System.Text.UTF8Encoding(false));
+        WriteMarkdown(report, Path.Combine(evidenceRoot, "migration-validation.md"));
+        AssetDatabase.SaveAssets();
+        Debug.Log("[MigrationValidation] " + effectArgument + " => " + (report.passed ? "PASS" : "FAIL") + "; " + jsonPath);
+        if (!report.passed) throw new InvalidOperationException("Migration validation failed. See " + jsonPath);
+    }
+
+    static void ConfigureProject(List<CheckEvidence> checks)
+    {
+        PlayerSettings.colorSpace = ColorSpace.Linear;
+        var pipeline = GraphicsSettings.defaultRenderPipeline as UniversalRenderPipelineAsset;
+        if (pipeline == null) pipeline = QualitySettings.renderPipeline as UniversalRenderPipelineAsset;
+        checks.Add(Check("urpPipelineActive", pipeline != null, pipeline == null ? "No active URP asset." : pipeline.name));
+        if (pipeline != null)
+        {
+            pipeline.supportsCameraDepthTexture = true;
+            pipeline.supportsCameraOpaqueTexture = true;
+            EditorUtility.SetDirty(pipeline);
+            var renderer = pipeline.GetRenderer(0);
+            var rendererName = renderer == null ? "missing" : renderer.GetType().Name;
+            checks.Add(Check("depthTextureEnabled", pipeline.supportsCameraDepthTexture, pipeline.supportsCameraDepthTexture.ToString()));
+            checks.Add(Check("opaqueTextureEnabled", pipeline.supportsCameraOpaqueTexture, pipeline.supportsCameraOpaqueTexture.ToString()));
+            checks.Add(Check("forwardRenderer", rendererName.IndexOf("UniversalRenderer", StringComparison.OrdinalIgnoreCase) >= 0, rendererName));
+        }
+        checks.Add(Check("linearColorSpace", PlayerSettings.colorSpace == ColorSpace.Linear, PlayerSettings.colorSpace.ToString()));
+    }
+
+    static EffectEvidence ValidateEffect(string effect, string evidenceRoot)
+    {
+        var effectFolder = Path.Combine(evidenceRoot, effect);
+        Directory.CreateDirectory(effectFolder);
+        var checks = new List<CheckEvidence>();
+        var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(Prefabs[effect]);
+        var shader = AssetDatabase.LoadAssetAtPath<Shader>(Graphs[effect]);
+        checks.Add(Check("prefabImported", prefab != null, Prefabs[effect]));
+        checks.Add(Check("graphImported", shader != null, Graphs[effect]));
+        checks.Add(Check("shaderSupported", shader != null && shader.isSupported, shader == null ? "missing" : shader.name));
+        if (prefab == null || shader == null)
+            return new EffectEvidence { effect = effect, checks = checks.ToArray(), passed = false };
+
+        var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+        scene.name = "Migration_" + effect;
+        var context = CreateRenderContext(effect);
+        var root = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+        root.name = "Imported " + effect;
+        PositionEffect(effect, root.transform);
+        AddEffectContext(effect, root, context);
+
+        var missingScripts = CountMissingScripts(root);
+        checks.Add(Check("noMissingScripts", missingScripts == 0, missingScripts.ToString()));
+        var renderers = root.GetComponentsInChildren<Renderer>(true);
+        var materials = renderers.SelectMany(renderer => renderer.sharedMaterials).Where(material => material != null).ToArray();
+        checks.Add(Check("hasRenderer", renderers.Length > 0, renderers.Length.ToString()));
+        checks.Add(Check("materialsUseSupportedShaders", materials.Length > 0 && materials.All(material => material.shader != null && material.shader.isSupported),
+            string.Join(", ", materials.Select(material => material.shader == null ? "missing" : material.shader.name).Distinct().ToArray())));
+
+        InitializeRuntimeOwnersAndControllers(root);
+        var controlA = ApplyState(effect, root, context, false);
+        Shader.WarmupAllShaders();
+        var stateA = Render(context.camera, Path.Combine(effectFolder, effect + "-state-a.png"));
+        var controlB = ApplyState(effect, root, context, true);
+        var stateB = Render(context.camera, Path.Combine(effectFolder, effect + "-state-b.png"));
+        var difference = MeanPixelDifference(stateA.pixels, stateB.pixels);
+        checks.Add(Check("controlApiApplied", controlA && controlB, "stateA=" + controlA + ", stateB=" + controlB));
+        checks.Add(Check("stateImagesDiffer", difference > 0.00005, difference.ToString("0.000000")));
+        checks.Add(Check("stateAHasVisualContent", stateA.standardDeviation > 0.025 && stateA.nonBlackRatio > 0.04,
+            "stddev=" + stateA.standardDeviation.ToString("0.0000") + ", nonBlack=" + stateA.nonBlackRatio.ToString("0.0000")));
+        checks.Add(Check("stateBHasVisualContent", stateB.standardDeviation > 0.025 && stateB.nonBlackRatio > 0.04,
+            "stddev=" + stateB.standardDeviation.ToString("0.0000") + ", nonBlack=" + stateB.nonBlackRatio.ToString("0.0000")));
+        checks.Add(Check("noMagentaFallback", stateA.magentaRatio < 0.02 && stateB.magentaRatio < 0.02,
+            "stateA=" + stateA.magentaRatio.ToString("0.000000") + ", stateB=" + stateB.magentaRatio.ToString("0.000000")));
+
+        var sceneFolder = "Assets/MigrationValidation";
+        if (!AssetDatabase.IsValidFolder(sceneFolder)) AssetDatabase.CreateFolder("Assets", "MigrationValidation");
+        var scenePath = sceneFolder + "/" + effect + ".unity";
+        var sceneSaved = EditorSceneManager.SaveScene(scene, scenePath);
+        checks.Add(Check("validationSceneSaved", sceneSaved, scenePath));
+        var evidence = new EffectEvidence
+        {
+            effect = effect,
+            prefabPath = Prefabs[effect],
+            graphPath = Graphs[effect],
+            shaderName = shader.name,
+            rendererCount = renderers.Length,
+            stateAPath = stateA.path,
+            stateASha256 = stateA.sha256,
+            stateBPath = stateB.path,
+            stateBSha256 = stateB.sha256,
+            meanPixelDifference = difference,
+            checks = checks.ToArray()
+        };
+        evidence.passed = evidence.checks.All(check => check.passed);
+        return evidence;
+    }
+
+    static RenderContext CreateRenderContext(string effect)
+    {
+        var cameraObject = new GameObject("Migration Camera");
+        cameraObject.tag = "MainCamera";
+        var camera = cameraObject.AddComponent<Camera>();
+        camera.clearFlags = CameraClearFlags.SolidColor;
+        camera.backgroundColor = new Color(0.005f, 0.008f, 0.018f, 1f);
+        camera.allowHDR = true;
+        camera.fieldOfView = 45f;
+        camera.nearClipPlane = 0.05f;
+        camera.farClipPlane = 50f;
+        camera.transform.position = effect == "06_ScanPulse" ? new Vector3(0f, 3.2f, -8.5f) : new Vector3(0f, 2.1f, -7.2f);
+        LookAt(camera.transform, effect == "05_InteractiveGrass" ? new Vector3(0f, 0.7f, 0f) : new Vector3(0f, 0.65f, 0.25f));
+        var cameraData = cameraObject.AddComponent<UniversalAdditionalCameraData>();
+        cameraData.renderPostProcessing = false;
+        cameraData.requiresDepthTexture = true;
+        cameraData.requiresColorTexture = true;
+
+        var lightObject = new GameObject("Migration Key Light");
+        var light = lightObject.AddComponent<Light>();
+        light.type = LightType.Directional;
+        light.intensity = 2.2f;
+        light.color = new Color(0.82f, 0.9f, 1f);
+        light.shadows = LightShadows.Soft;
+        lightObject.transform.rotation = Quaternion.Euler(45f, -35f, 0f);
+
+        var fillObject = new GameObject("Migration Fill Light");
+        var fill = fillObject.AddComponent<Light>();
+        fill.type = LightType.Point;
+        fill.intensity = 500f;
+        fill.range = 15f;
+        fill.color = new Color(0.15f, 0.35f, 1f);
+        fillObject.transform.position = new Vector3(-3f, 3.5f, -3f);
+
+        var context = new RenderContext { camera = camera };
+        if (effect != "03_HeatHaze")
+        {
+            var floor = Primitive(PrimitiveType.Cube, "Migration Floor", new Vector3(0f, -0.72f, 0.6f), new Vector3(8f, 0.35f, 6f), Lit(new Color(0.055f, 0.075f, 0.12f)));
+            context.temporaryObjects.Add(floor);
+        }
+        return context;
+    }
+
+    static void PositionEffect(string effect, Transform root)
+    {
+        root.position = effect == "05_InteractiveGrass" ? new Vector3(0f, -0.48f, 0f) :
+            effect == "06_ScanPulse" ? new Vector3(0f, -0.45f, 0f) : new Vector3(0f, 0.35f, 0f);
+        if (effect == "01_Dissolve") root.localScale = Vector3.one * 2.6f;
+        else if (effect == "03_HeatHaze") root.localScale = Vector3.one * 1.45f;
+        else if (effect == "04_TriplanarSnow") root.localScale = Vector3.one * 1.45f;
+        else if (effect == "05_InteractiveGrass") root.localScale = Vector3.one * 2.8f;
+        else if (effect == "06_ScanPulse") root.localScale = Vector3.one * 0.85f;
+    }
+
+    static void AddEffectContext(string effect, GameObject root, RenderContext context)
+    {
+        if (effect == "02_IntersectionShield")
+        {
+            context.temporaryObjects.Add(Primitive(PrimitiveType.Cube, "Shield Intersector", new Vector3(0.1f, 0.35f, 0f), new Vector3(0.65f, 2.6f, 0.65f), Lit(new Color(0.75f, 0.08f, 0.04f))));
+            context.temporaryObjects.Add(Primitive(PrimitiveType.Cube, "Shield Depth Reference", new Vector3(-1.8f, 0f, 0.8f), new Vector3(0.65f, 1.5f, 0.65f), Lit(new Color(0.04f, 0.2f, 0.55f))));
+        }
+        else if (effect == "03_HeatHaze")
+        {
+            var texture = CheckerTexture();
+            context.temporaryObjects.Add(texture);
+            var backdropMaterial = Lit(Color.white);
+            backdropMaterial.SetTexture("_BaseMap", texture);
+            context.temporaryObjects.Add(backdropMaterial);
+            context.temporaryObjects.Add(Primitive(PrimitiveType.Quad, "Heat Grid", new Vector3(0f, 0.7f, 1.8f), new Vector3(6.5f, 4.2f, 1f), backdropMaterial));
+            for (var index = -2; index <= 2; index++)
+                context.temporaryObjects.Add(Primitive(PrimitiveType.Cylinder, "Heat Column " + index,
+                    new Vector3(index * 0.7f, 0.65f, 1.25f), new Vector3(0.13f, 1.5f, 0.13f),
+                    Lit(index % 2 == 0 ? new Color(0.75f, 0.08f, 0.04f) : new Color(0.04f, 0.22f, 0.65f))));
+        }
+        else if (effect == "05_InteractiveGrass")
+        {
+            var interactor = Primitive(PrimitiveType.Sphere, "Grass Interactor", new Vector3(-0.9f, 0.4f, 0f), Vector3.one * 0.38f, Lit(new Color(0.8f, 0.08f, 0.04f)));
+            context.interactor = interactor.transform;
+            context.temporaryObjects.Add(interactor);
+        }
+    }
+
+    static void InitializeRuntimeOwnersAndControllers(GameObject root)
+    {
+        var components = root.GetComponentsInChildren<MonoBehaviour>(true).Where(component => component != null).ToArray();
+        foreach (var owner in components.Where(component => component.GetType().Name == "MaterialInstanceOwner"))
+            Invoke(owner, "EnsureInitialized");
+        foreach (var controller in components.Where(component => component.GetType().Name.EndsWith("Controller", StringComparison.Ordinal)))
+        {
+            Invoke(controller, "Awake", true);
+            Invoke(controller, "OnEnable", true);
+        }
+        foreach (var renderer in root.GetComponentsInChildren<Renderer>(true))
+        {
+            var materials = renderer.sharedMaterials;
+            for (var index = 0; index < materials.Length; index++)
+                if (materials[index] != null && !materials[index].name.Contains("Owned by"))
+                    materials[index] = new Material(materials[index]) { hideFlags = HideFlags.DontSave };
+            renderer.sharedMaterials = materials;
+        }
+    }
+
+    static bool ApplyState(string effect, GameObject root, RenderContext context, bool secondState)
+    {
+        var materials = root.GetComponentsInChildren<Renderer>(true).SelectMany(renderer => renderer.sharedMaterials).Where(material => material != null).ToArray();
+        if (effect == "01_Dissolve")
+            return InvokeController(root, "DissolveController", "SetProgress", secondState ? 0.72f : 0.08f);
+        if (effect == "02_IntersectionShield")
+        {
+            SetFloat(materials, "_ContactWidth", secondState ? 0.7f : 0.06f);
+            SetFloat(materials, "_Opacity", secondState ? 0.85f : 0.45f);
+            return materials.Any(material => material.HasProperty("_ContactWidth"));
+        }
+        if (effect == "03_HeatHaze")
+        {
+            var time = InvokeController(root, "HeatHazeController", "SetManualTime", secondState ? 1.75f : 0f);
+            var opacity = InvokeController(root, "HeatHazeController", "SetOpacity", 1f);
+            return time && opacity;
+        }
+        if (effect == "04_TriplanarSnow")
+        {
+            SetFloat(materials, "_SnowAmount", secondState ? 0.95f : 0.12f);
+            root.transform.rotation = Quaternion.Euler(secondState ? 32f : 12f, secondState ? 42f : 5f, secondState ? 24f : 8f);
+            return materials.Any(material => material.HasProperty("_SnowAmount"));
+        }
+        if (effect == "05_InteractiveGrass")
+        {
+            var controller = FindController(root, "InteractiveGrassController");
+            if (controller == null || context.interactor == null) return false;
+            var property = controller.GetType().GetProperty("Interactor", BindingFlags.Public | BindingFlags.Instance);
+            if (property == null) return false;
+            context.interactor.position = secondState ? new Vector3(0.85f, 0.4f, 0f) : new Vector3(-0.85f, 0.4f, 0f);
+            property.SetValue(controller, context.interactor, null);
+            return Invoke(controller, "SetBend", false, 1.4f, 0.85f) && Invoke(controller, "SetManualTime", false, secondState ? 1.5f : 0f);
+        }
+        if (effect == "06_ScanPulse")
+            return InvokeController(root, "ScanPulseController", "SetState", true, secondState ? 2.6f : 0.35f);
+        return false;
+    }
+
+    static bool InvokeController(GameObject root, string typeName, string methodName, params object[] arguments)
+    {
+        var controller = FindController(root, typeName);
+        return controller != null && Invoke(controller, methodName, false, arguments);
+    }
+
+    static MonoBehaviour FindController(GameObject root, string typeName)
+    {
+        return root.GetComponentsInChildren<MonoBehaviour>(true).FirstOrDefault(component => component != null && component.GetType().Name == typeName);
+    }
+
+    static bool Invoke(MonoBehaviour component, string methodName, bool optional = false, params object[] arguments)
+    {
+        var method = component.GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (method == null) return optional;
+        method.Invoke(component, arguments);
+        return true;
+    }
+
+    static void SetFloat(IEnumerable<Material> materials, string propertyName, float value)
+    {
+        foreach (var material in materials) if (material.HasProperty(propertyName)) material.SetFloat(propertyName, value);
+    }
+
+    static RenderedImage Render(Camera camera, string path)
+    {
+        const int width = 960;
+        const int height = 540;
+        var target = new RenderTexture(width, height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+        target.Create();
+        camera.targetTexture = target;
+        camera.Render();
+        camera.Render();
+        var previous = RenderTexture.active;
+        RenderTexture.active = target;
+        var image = new Texture2D(width, height, TextureFormat.RGB24, false, false);
+        image.ReadPixels(new Rect(0f, 0f, width, height), 0, 0, false);
+        image.Apply(false, false);
+        var pixels = image.GetPixels32();
+        var bytes = image.EncodeToPNG();
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        File.WriteAllBytes(path, bytes);
+        camera.targetTexture = null;
+        RenderTexture.active = previous;
+        target.Release();
+        UnityEngine.Object.DestroyImmediate(target);
+        UnityEngine.Object.DestroyImmediate(image);
+
+        double luminanceSum = 0d;
+        double luminanceSquareSum = 0d;
+        var nonBlack = 0;
+        var magenta = 0;
+        foreach (var pixel in pixels)
+        {
+            var luminance = (0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b) / 255d;
+            luminanceSum += luminance;
+            luminanceSquareSum += luminance * luminance;
+            if (pixel.r + pixel.g + pixel.b > 35) nonBlack++;
+            if (pixel.r > 220 && pixel.b > 220 && pixel.g < 45) magenta++;
+        }
+        var mean = luminanceSum / pixels.Length;
+        var variance = Math.Max(0d, luminanceSquareSum / pixels.Length - mean * mean);
+        return new RenderedImage
+        {
+            path = Path.GetFullPath(path),
+            sha256 = Sha256(path),
+            pixels = pixels,
+            standardDeviation = Math.Sqrt(variance),
+            nonBlackRatio = (double)nonBlack / pixels.Length,
+            magentaRatio = (double)magenta / pixels.Length
+        };
+    }
+
+    static double MeanPixelDifference(Color32[] first, Color32[] second)
+    {
+        if (first == null || second == null || first.Length != second.Length) return 1d;
+        double total = 0d;
+        for (var index = 0; index < first.Length; index++)
+            total += Math.Abs(first[index].r - second[index].r) + Math.Abs(first[index].g - second[index].g) + Math.Abs(first[index].b - second[index].b);
+        return total / (first.Length * 3d * 255d);
+    }
+
+    static int CountMissingScripts(GameObject root)
+    {
+        var count = 0;
+        foreach (var transform in root.GetComponentsInChildren<Transform>(true))
+            count += GameObjectUtility.GetMonoBehavioursWithMissingScriptCount(transform.gameObject);
+        return count;
+    }
+
+    static GameObject Primitive(PrimitiveType type, string name, Vector3 position, Vector3 scale, Material material)
+    {
+        var item = GameObject.CreatePrimitive(type);
+        item.name = name;
+        item.transform.position = position;
+        item.transform.localScale = scale;
+        item.GetComponent<Renderer>().sharedMaterial = material;
+        return item;
+    }
+
+    static Material Lit(Color color)
+    {
+        var shader = Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null) throw new InvalidOperationException("URP Lit shader is missing.");
+        var material = new Material(shader) { hideFlags = HideFlags.DontSave };
+        material.SetColor("_BaseColor", color);
+        material.SetFloat("_Smoothness", 0.35f);
+        return material;
+    }
+
+    static Texture2D CheckerTexture()
+    {
+        const int size = 128;
+        var texture = new Texture2D(size, size, TextureFormat.RGB24, false, false) { wrapMode = TextureWrapMode.Repeat, hideFlags = HideFlags.DontSave };
+        var pixels = new Color[size * size];
+        for (var y = 0; y < size; y++)
+        for (var x = 0; x < size; x++)
+        {
+            var line = x % 16 < 2 || y % 16 < 2;
+            pixels[y * size + x] = line ? new Color(0.04f, 0.8f, 1f) : new Color(0.08f, 0.09f, 0.22f);
+        }
+        texture.SetPixels(pixels);
+        texture.Apply(false, false);
+        return texture;
+    }
+
+    static void LookAt(Transform transform, Vector3 target)
+    {
+        transform.rotation = Quaternion.LookRotation(target - transform.position, Vector3.up);
+    }
+
+    static CheckEvidence Check(string name, bool passed, string detail)
+    {
+        return new CheckEvidence { name = name, passed = passed, detail = detail };
+    }
+
+    static string GetArgument(string name)
+    {
+        var args = Environment.GetCommandLineArgs();
+        for (var index = 0; index + 1 < args.Length; index++)
+            if (string.Equals(args[index], name, StringComparison.OrdinalIgnoreCase)) return args[index + 1];
+        return null;
+    }
+
+    static string Sha256(string path)
+    {
+        using (var stream = File.OpenRead(path))
+        using (var sha = SHA256.Create())
+            return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty).ToLowerInvariant();
+    }
+
+    static void WriteMarkdown(MigrationEvidence report, string path)
+    {
+        var lines = new List<string>
+        {
+            "# Migration validation — " + report.requestedEffect,
+            string.Empty,
+            "- Result: **" + (report.passed ? "PASS" : "FAIL") + "**",
+            "- Unity: " + report.unityVersion,
+            "- URP: " + report.urpVersion,
+            "- Shader Graph: " + report.shaderGraphVersion,
+            "- Package SHA-256: `" + report.packageSha256 + "`",
+            string.Empty,
+            "| Effect | Pixel difference | Result |",
+            "|---|---:|---|"
+        };
+        foreach (var effect in report.effects)
+            lines.Add("| " + effect.effect + " | " + effect.meanPixelDifference.ToString("0.000000") + " | " + (effect.passed ? "PASS" : "FAIL") + " |");
+        File.WriteAllLines(path, lines.ToArray(), new System.Text.UTF8Encoding(false));
+    }
+
+    sealed class RenderContext
+    {
+        public Camera camera;
+        public Transform interactor;
+        public readonly List<UnityEngine.Object> temporaryObjects = new List<UnityEngine.Object>();
+    }
+
+    sealed class RenderedImage
+    {
+        public string path;
+        public string sha256;
+        public Color32[] pixels;
+        public double standardDeviation;
+        public double nonBlackRatio;
+        public double magentaRatio;
+    }
+
+    [Serializable]
+    public sealed class CheckEvidence
+    {
+        public string name;
+        public bool passed;
+        public string detail;
+    }
+
+    [Serializable]
+    public sealed class EffectEvidence
+    {
+        public string effect;
+        public string prefabPath;
+        public string graphPath;
+        public string shaderName;
+        public int rendererCount;
+        public string stateAPath;
+        public string stateASha256;
+        public string stateBPath;
+        public string stateBSha256;
+        public double meanPixelDifference;
+        public CheckEvidence[] checks;
+        public bool passed;
+    }
+
+    [Serializable]
+    public sealed class MigrationEvidence
+    {
+        public string generatedUtc;
+        public string projectPath;
+        public string unityVersion;
+        public string urpVersion;
+        public string shaderGraphVersion;
+        public string packagePath;
+        public string packageSha256;
+        public string requestedEffect;
+        public CheckEvidence[] projectChecks;
+        public EffectEvidence[] effects;
+        public bool passed;
+    }
+}

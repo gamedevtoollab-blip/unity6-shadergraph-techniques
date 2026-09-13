@@ -1,0 +1,14 @@
+{
+  "name": "Unity.ShaderGraphTool.Editor",
+  "rootNamespace": "ShaderGraphTechniques.Editor",
+  "references": [
+    "ShaderGraphTechniques.Runtime",
+    "ShaderGraphTechniques.Demo",
+    "Unity.ShaderGraph.Editor",
+    "Unity.RenderPipelines.Universal.Editor",
+    "Unity.RenderPipelines.Universal.Runtime",
+    "Unity.RenderPipelines.Core.Runtime"
+  ],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": true
+}
